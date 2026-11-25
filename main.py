@@ -1,132 +1,350 @@
+
 import os
 import sys
 import time
 import signal
+import logging
 import subprocess
-from datetime import datetime, timezone
+from threading import Thread
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from PIL import Image, ImageDraw, ImageFont
 
-WIDTH, HEIGHT = 1280, 720
-FPS_INPUT = 1
+# =========================
+# CONFIGURATION
+# =========================
+
+WIDTH = 854
+HEIGHT = 480
+FPS = 30
+BITRATE = "600k"
 CYCLE_SECONDS = 24 * 60 * 60
 
-RTMP_URL = os.environ.get("YOUTUBE_RTMP_URL", "").strip().rstrip("/")
-STREAM_KEY = os.environ.get("YOUTUBE_STREAM_KEY", "").strip()
-TITLE = os.environ.get("COUNTDOWN_TITLE", "24/7 COUNTDOWN")
-SUBTITLE = os.environ.get("COUNTDOWN_SUBTITLE", "LIVE ON YOUTUBE")
-BACKGROUND = (8, 13, 27)
-WHITE = (245, 248, 255)
-MUTED = (145, 163, 190)
-ACCENT = (65, 164, 255)
+RTMP_URL = os.getenv("YOUTUBE_RTMP_URL", "").strip().rstrip("/")
+STREAM_KEY = os.getenv("YOUTUBE_STREAM_KEY", "").strip()
+
+TITLE = os.getenv("COUNTDOWN_TITLE", "24/7 COUNTDOWN")
+SUBTITLE = os.getenv("COUNTDOWN_SUBTITLE", "LIVE ON YOUTUBE")
+
+PORT = int(os.getenv("PORT", "10000"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 running = True
+ffmpeg_process = None
 
-def stop_handler(_signum, _frame):
-    global running
-    running = False
+# =========================
+# HEALTH CHECK SERVER
+# =========================
 
-signal.signal(signal.SIGTERM, stop_handler)
-signal.signal(signal.SIGINT, stop_handler)
+class HealthHandler(BaseHTTPRequestHandler):
 
-def load_font(path, size):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
+            response = (
+                b'{"status":"ok","service":"countdown-streamer"}'
+            )
+            self.wfile.write(response)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    logging.info("Health server listening on port %s", PORT)
+    server.serve_forever()
+
+
+# =========================
+# FONTS
+# =========================
+
+def load_font(size, bold=False):
+
+    if bold:
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    else:
+        path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
     try:
         return ImageFont.truetype(path, size)
     except OSError:
         return ImageFont.load_default()
 
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
-def centered(draw, y, text, font, fill):
-    box = draw.textbbox((0, 0), text, font=font)
-    x = (WIDTH - (box[2] - box[0])) // 2
-    draw.text((x, y), text, font=font, fill=fill)
+# =========================
+# COUNTDOWN DESIGN
+# =========================
 
-def make_frame(seconds_left):
-    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
-    draw = ImageDraw.Draw(image)
+def draw_center(draw, y, text, font, color):
 
-    # Subtle decorative frame and accents
-    draw.rounded_rectangle((42, 42, WIDTH - 42, HEIGHT - 42), radius=28,
-                           outline=(31, 48, 76), width=2)
-    draw.rounded_rectangle((WIDTH // 2 - 115, 112, WIDTH // 2 + 115, 154),
-                           radius=21, fill=(18, 45, 75))
-    draw.ellipse((WIDTH // 2 - 91, 126, WIDTH // 2 - 77, 140), fill=(255, 62, 82))
-    centered(draw, 118, "LIVE", load_font(FONT_BOLD, 20), WHITE)
+    bounds = draw.textbbox((0, 0), text, font=font)
+    width = bounds[2] - bounds[0]
 
-    centered(draw, 205, TITLE, load_font(FONT_BOLD, 42), WHITE)
+    x = (WIDTH - width) // 2
 
-    hours = seconds_left // 3600
-    minutes = (seconds_left % 3600) // 60
-    seconds = seconds_left % 60
+    draw.text(
+        (x, y),
+        text,
+        font=font,
+        fill=color
+    )
+
+
+def create_frame():
+
+    # Countdown resets every 24 hours
+    now = int(time.time())
+    remaining = CYCLE_SECONDS - (now % CYCLE_SECONDS)
+
+    hours = remaining // 3600
+    minutes = (remaining % 3600) // 60
+    seconds = remaining % 60
+
     timer = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-    # Timer panel
-    draw.rounded_rectangle((190, 300, WIDTH - 190, 465), radius=30,
-                           fill=(14, 24, 43), outline=(37, 67, 103), width=2)
-    centered(draw, 325, timer, load_font(FONT_BOLD, 112), ACCENT)
+    image = Image.new(
+        "RGB",
+        (WIDTH, HEIGHT),
+        (8, 13, 27)
+    )
 
-    centered(draw, 510, SUBTITLE, load_font(FONT_BOLD, 25), MUTED)
-    centered(draw, 580, "The countdown resets every 24 hours",
-             load_font(FONT_REG, 19), (104, 126, 157))
+    draw = ImageDraw.Draw(image)
+
+    # Outer border
+    draw.rounded_rectangle(
+        (22, 22, WIDTH - 22, HEIGHT - 22),
+        radius=20,
+        outline=(35, 57, 88),
+        width=2
+    )
+
+    # Live indicator
+    draw.ellipse(
+        (WIDTH // 2 - 48, 70, WIDTH // 2 - 34, 84),
+        fill=(255, 65, 80)
+    )
+
+    draw_center(
+        draw,
+        65,
+        "LIVE",
+        load_font(18, True),
+        (245, 248, 255)
+    )
+
+    # Main title
+    draw_center(
+        draw,
+        140,
+        TITLE,
+        load_font(35, True),
+        (245, 248, 255)
+    )
+
+    # Timer background
+    draw.rounded_rectangle(
+        (75, 215, WIDTH - 75, 340),
+        radius=22,
+        fill=(15, 27, 48),
+        outline=(38, 65, 100),
+        width=2
+    )
+
+    # Timer
+    draw_center(
+        draw,
+        224,
+        timer,
+        load_font(78, True),
+        (75, 170, 255)
+    )
+
+    # Subtitle
+    draw_center(
+        draw,
+        380,
+        SUBTITLE,
+        load_font(21, True),
+        (160, 180, 210)
+    )
+
+    draw_center(
+        draw,
+        420,
+        "THE COUNTDOWN RESETS EVERY 24 HOURS",
+        load_font(12),
+        (105, 125, 155)
+    )
+
     return image
 
+
+# =========================
+# FFMPEG
+# =========================
+
 def build_ffmpeg_command():
+
     destination = f"{RTMP_URL}/{STREAM_KEY}"
+
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-re", "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{WIDTH}x{HEIGHT}", "-framerate", str(FPS_INPUT),
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{WIDTH}x{HEIGHT}",
+        "-framerate", "1",
         "-i", "pipe:0",
-        "-an", "-vf", "fps=30,scale=640:360,format=yuv420p",
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-tune", "zerolatency", "-b:v", "400k",
-        "-maxrate", "400k", "-bufsize", "800k",
-        "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
-        "-f", "flv", destination
+
+        "-an",
+
+        "-vf", "fps=30,format=yuv420p",
+
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+
+        "-b:v", BITRATE,
+        "-maxrate", BITRATE,
+        "-bufsize", "1200k",
+
+        "-g", "60",
+        "-keyint_min", "60",
+        "-sc_threshold", "0",
+
+        "-f", "flv",
+        destination
     ]
 
-def main():
-    if not RTMP_URL or not STREAM_KEY:
-        print("ERROR: Set YOUTUBE_RTMP_URL and YOUTUBE_STREAM_KEY in Render Environment.", flush=True)
-        sys.exit(1)
 
-    print("Countdown streamer starting. Stream key is hidden from logs.", flush=True)
+# =========================
+# STREAMING LOOP
+# =========================
+
+def start_stream():
+
+    global ffmpeg_process
+
     while running:
-        proc = subprocess.Popen(
-            build_ffmpeg_command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        print("FFmpeg encoder started.", flush=True)
+
+        logging.info("Starting FFmpeg encoder...")
+
         try:
-            while running and proc.poll() is None:
-                now = int(time.time())
-                remaining = CYCLE_SECONDS - (now % CYCLE_SECONDS)
-                frame = make_frame(remaining)
-                proc.stdin.write(frame.tobytes())
-                proc.stdin.flush()
+
+            ffmpeg_process = subprocess.Popen(
+                build_ffmpeg_command(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+            logging.info("FFmpeg process started.")
+
+            while running and ffmpeg_process.poll() is None:
+
+                frame = create_frame()
+
+                ffmpeg_process.stdin.write(
+                    frame.tobytes()
+                )
+
+                ffmpeg_process.stdin.flush()
+
                 time.sleep(1)
-        except (BrokenPipeError, OSError):
-            print("Encoder connection ended; restarting in 5 seconds.", flush=True)
+
+        except (BrokenPipeError, OSError) as error:
+
+            logging.error(
+                "FFmpeg connection error: %s",
+                type(error).__name__
+            )
+
         finally:
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except OSError:
-                pass
-            if proc.poll() is None:
-                proc.terminate()
+
+            if ffmpeg_process:
+
                 try:
-                    proc.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                    if ffmpeg_process.stdin:
+                        ffmpeg_process.stdin.close()
+                except OSError:
+                    pass
+
+                if ffmpeg_process.poll() is None:
+                    ffmpeg_process.terminate()
+
+                    try:
+                        ffmpeg_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        ffmpeg_process.kill()
+                        ffmpeg_process.wait()
+
+                ffmpeg_process = None
+
         if running:
+            logging.warning("Restarting FFmpeg in 5 seconds...")
             time.sleep(5)
 
-    print("Countdown streamer stopped.", flush=True)
+
+# =========================
+# SHUTDOWN
+# =========================
+
+def shutdown_handler(signum, frame):
+
+    global running
+
+    logging.info("Shutdown signal received.")
+
+    running = False
+
+    if ffmpeg_process and ffmpeg_process.poll() is None:
+        ffmpeg_process.terminate()
+
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    if not RTMP_URL or not STREAM_KEY:
+        logging.error("YouTube RTMP environment variables are missing.")
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    health_thread = Thread(
+        target=start_health_server,
+        daemon=True
+    )
+
+    health_thread.start()
+
+    logging.info("Countdown service initialized.")
+    logging.info("Resolution: 854x480")
+    logging.info("Video bitrate: %s", BITRATE)
+
+    start_stream()
+
 
 if __name__ == "__main__":
     main()
